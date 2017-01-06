@@ -40,7 +40,7 @@ def get_args(**kwargs):
     return data
 
 def fmt(s):
-    return s.strip().replace('\r\n', '')
+    return s.strip().replace('\r\n', '').replace('\u00a0', ' ')
 
 def get_price_id(soup, id):
     jsid = id.split('upgradePrice')[1]
@@ -55,8 +55,20 @@ def get_price_id(soup, id):
             return line
     return "(unknown)"
 
+def get_points_id(soup, id):
+    jsid = id.split('upgradePoints')[1]
+    jsdef = "jnyPoints['{}']".format(jsid)
+    for scr in soup.select("script"):
+        if jsdef in scr.text:
+            line = scr.text.split(jsdef)[1]
+            line = line.split('"]')[0]
+            line = line.split('["')[1]
+            return line
+    return "(unknown)"
+
 def return_results(**args):
-    r = requests.post("https://tickets.amtrak.com/itd/amtrak",
+    sess = requests.Session()
+    r = sess.post("https://tickets.amtrak.com/itd/amtrak",
                       params=get_args(**args),
                       headers={"User-Agent": "Mozilla/5.0 (Windows; U; Windows NT 6.1; en-US; rv:0.9.4.1) Gecko/20020508 Netscape6/6.2.3",})
     soup = BeautifulSoup(r.text, "lxml")
@@ -67,7 +79,7 @@ def return_results(**args):
         result["errors"].append(e.text)
 
     options = soup.select("table.ffam-fare-family")
-    result["num"] = len(options)
+    avail = 0
     for o in options:
         r = {}
         addCartSoldOut = o.select_one(".ffam-button-container")
@@ -75,13 +87,22 @@ def return_results(**args):
             r["cancelled"] = True
         elif addCartSoldOut.select_one(".ffam-add-to-cart"):
             r["cancelled"] = False
+            avail += 1
         segment = o.select_one(".ffam-segment-container")
         col1 = segment.select_one(".ffam-first-col")
         if col1:
-            r["time"] = fmt(col1.select_one(".ffam-time").text)
+            time = fmt(col1.select_one(".ffam-time").text).split(" - ")
+            r["time"] = ({
+                "start": time[0],
+                "end": time[1]
+            } if len(time) > 1 else time[0])
+
+            tname = fmt(col1.select_one(".ffam-train-name-padding").text)
+            tid = col1.select_one(".ffam-train-name-container").attrs['id']
             r["train"] = {
-                "name": fmt(col1.select_one(".ffam-train-name-padding").text),
-                "id": col1.select_one(".ffam-train-name-container").attrs['id']
+                "name": tname,
+                "id": tid,
+                "route": tname.split("{} ".format(tid))[1]
             }
         icons = o.select(".ffam-icons a img")
         r["amenities"] = []
@@ -136,4 +157,36 @@ def return_results(**args):
 
         result["results"].append(r)
 
+    result["number"] = {
+        "total": len(options),
+        "available": avail
+    }
+
+    result = get_points(sess, result)
+
     return result
+
+def get_points(sess, result):
+    r = sess.get("https://tickets.amtrak.com/itd/amtrak/GetRedemptionPoints",
+        headers={"User-Agent": "Mozilla/5.0 (Windows; U; Windows NT 6.1; en-US; rv:0.9.4.1) Gecko/20020508 Netscape6/6.2.3",})
+    soup = BeautifulSoup(r.text, "lxml")
+    options = soup.select("table.ffam-fare-family")
+    i = 0
+    for o in options:
+        r = result["results"][i]
+        j = 0
+        ffpr = o.select(".ffam-prices-container > td")
+        for f in ffpr:
+            pr = f.select_one(".ffam-price-container")
+            if pr:
+                points = fmt(pr.text).replace(" points", "")
+                if len(points) < 1:
+                    points = get_points_id(soup, pr.select_one("span").attrs['id'])
+                    r["fares"][j]["points_js"] = True
+                r["fares"][j]["points"] = int(points) if points.isdigit() else points
+
+            j += 1
+
+        i += 1
+    return result
+
